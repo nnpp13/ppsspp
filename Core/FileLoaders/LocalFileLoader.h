@@ -21,27 +21,32 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/File/Path.h"
+#include "Common/StringUtils.h"
 #include "Core/Loaders.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(HAVE_LIBRETRO_VFS)
 typedef void *HANDLE;
 #endif
 
+// This one accepts directories as well as files.
+// Later we handle the discrepancy in MountGameISO.
 class LocalFileLoader : public FileLoader {
 public:
 	LocalFileLoader(const Path &filename);
-	virtual ~LocalFileLoader();
+	~LocalFileLoader();
 
-	virtual bool Exists() override;
-	virtual bool IsDirectory() override;
-	virtual s64 FileSize() override;
-	virtual Path GetPath() const override {
+	bool Exists() override;
+	bool IsDirectory() override { return isDirectory_; }
+	s64 FileSize() override;
+	Path GetPath() const override {
 		return filename_;
 	}
-	virtual size_t ReadAt(s64 absolutePos, size_t bytes, size_t count, void *data, Flags flags = Flags::NONE) override;
+	size_t ReadAt(s64 absolutePos, size_t bytes, size_t count, void *data, Flags flags = Flags::NONE) override;
 
 private:
-#ifndef _WIN32
+#ifdef HAVE_LIBRETRO_VFS
+	FILE *file_ = nullptr;
+#elif !defined(_WIN32)
 	void DetectSizeFd();
 	int fd_ = -1;
 #else
@@ -49,6 +54,6 @@ private:
 #endif
 	u64 filesize_ = 0;
 	Path filename_;
+	bool isDirectory_ = false;
 	std::mutex readLock_;
-	bool isOpenedByFd_ = false;
 };

@@ -3,6 +3,11 @@
 #include "ppsspp_config.h"
 
 #include <string>
+#include <string_view>
+
+#ifdef HAVE_LIBRETRO_VFS
+#include "libretro/LibretroFileStreamTransforms.h"
+#endif
 
 #if defined(__APPLE__)
 
@@ -27,7 +32,7 @@
 enum class PathType {
 	UNDEFINED = 0,
 	NATIVE = 1,  // Can be relative.
-	CONTENT_URI = 2,  // Android only. Can only be absolute!
+	CONTENT_URI = 2,  // Android storage. Recognized everywhere, but only usable on Android. Can only be absolute!
 	HTTP = 3,  // http://, https://
 };
 
@@ -36,11 +41,11 @@ enum class PathType {
 
 class Path {
 private:
-	void Init(const std::string &str);
+	void Init(std::string_view str);
 
 public:
 	Path() : type_(PathType::UNDEFINED) {}
-	explicit Path(const std::string &str);
+	explicit Path(std::string_view str);
 
 #if PPSSPP_PLATFORM(WINDOWS)
 	explicit Path(const std::wstring &str);
@@ -49,9 +54,20 @@ public:
 	PathType Type() const {
 		return type_;
 	}
+	bool IsLocalType() const {
+		return type_ == PathType::NATIVE || type_ == PathType::CONTENT_URI;
+	}
 
 	bool Valid() const { return !path_.empty(); }
-	bool IsRoot() const { return path_ == "/"; }  // Special value - only path that can end in a slash.
+	bool IsRoot() const { return path_ == "/"; }  // Special value - only path that can end in a slash - except see below.
+	// On Windows, "//" is the network folder that lists the servers, the other path that ends in a slash.
+	bool IsNetworkRoot() const {
+#if PPSSPP_PLATFORM(WINDOWS)
+		return path_ == "//";
+#else
+		return false;
+#endif
+	}
 
 	// Some std::string emulation for simplicity.
 	bool empty() const { return !Valid(); }
@@ -71,28 +87,40 @@ public:
 	bool IsAbsolute() const;
 
 	// Returns a path extended with a subdirectory.
-	Path operator /(const std::string &subdir) const;
+	Path operator /(std::string_view subdir) const;
 
 	// Navigates down into a subdir.
-	void operator /=(const std::string &subdir);
+	void operator /=(std::string_view subdir);
 
 	// File extension manipulation.
-	Path WithExtraExtension(const std::string &ext) const;
-	Path WithReplacedExtension(const std::string &oldExtension, const std::string &newExtension) const;
+	Path WithExtraExtension(std::string_view ext) const;
+	// Swaps one known extension for another, e.g. ".ppst" -> ".jpg". Returns false and leaves *out
+	// alone if the path doesn't actually end in oldExtension. That case has to be handled: this
+	// used to return the path unchanged, so a caller that guessed the extension wrong quietly
+	// carried on with the original file - and "delete the screenshot next to this savestate" then
+	// means "delete the savestate".
+	[[nodiscard]] bool WithReplacedExtension(const std::string &oldExtension, const std::string &newExtension, Path *out) const;
+	// Replaces whatever extension is there, so there's nothing to fail on.
 	Path WithReplacedExtension(const std::string &newExtension) const;
 
-	// Removes the last component.
 	std::string GetFilename() const;  // Really, GetLastComponent. Could be a file or directory. Includes the extension.
 	std::string GetFileExtension() const;  // Always lowercase return. Includes the dot.
+	// Removes the last component.
 	std::string GetDirectory() const;
 
 	const std::string &ToString() const;
 
 #if PPSSPP_PLATFORM(WINDOWS)
 	std::wstring ToWString() const;
+	std::string ToCString() const;  // Flips the slashes back to Windows standard, but string still UTF-8.
+#else
+	std::string ToCString() const {
+		return ToString();
+	}
 #endif
 
-	std::string ToVisualString() const;
+	// Pass in a relative root to turn the path into a relative path - if it is one!
+	std::string ToVisualString(const char *relativeRoot = nullptr) const;
 
 	bool CanNavigateUp() const;
 	Path NavigateUp() const;
@@ -111,12 +139,19 @@ public:
 		return path_ != other.path_ || type_ != other.type_;
 	}
 
-	bool FilePathContains(const std::string &needle) const;
+	bool FilePathContainsNoCase(std::string_view needle) const;
 
+	// WARNING: This can return wrong results if two ContentURI have different root paths.
 	bool StartsWith(const Path &other) const;
+
+	// This handles ContentURI with different paths "correctly". Very specific use case.
+	bool StartsWithGlobalAndNotEqual(const Path &other) const;
 
 	bool operator <(const Path &other) const {
 		return path_ < other.path_;
+	}
+	bool operator >(const Path &other) const {
+		return path_ > other.path_;
 	}
 
 private:
@@ -129,10 +164,7 @@ private:
 	PathType type_;
 };
 
-
-// Utility function for fixing the case of paths. Only present on Unix-like systems.
-
-#if HOST_IS_CASE_SENSITIVE
+// Utility function for fixing the case of paths. Only necessary on Unix-like systems.
 
 enum FixPathCaseBehavior {
 	FPC_FILE_MUST_EXIST,  // all path components must exist (rmdir, move from)
@@ -141,5 +173,3 @@ enum FixPathCaseBehavior {
 };
 
 bool FixPathCase(const Path &basePath, std::string &path, FixPathCaseBehavior behavior);
-
-#endif

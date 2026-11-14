@@ -18,6 +18,8 @@
 #pragma once
 
 #include <list>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,62 +30,100 @@
 #include "Common/UI/Tween.h"
 #include "Core/KeyMap.h"
 #include "Core/ControlMapper.h"
+#include "Core/CoreParameter.h"
+#include "UI/ImDebugger/ImCommand.h"
 
 struct AxisInput;
+struct DisplayLayoutConfig;
 
 class AsyncImageFileView;
-class OnScreenMessagesView;
+class ImposeHomeScreen;
 class ChatMenu;
+class ImDebugger;
+struct ImCommand;
+struct ImGuiContext;
 
-class EmuScreen : public UIScreen {
+class EmuScreen : public UIScreen, protected ControlListener {
 public:
-	EmuScreen(const Path &filename);
+	// mountIso, if set, is mounted on umd1: when filename is an ELF/PBP (like the VSH).
+	// umdAutoboot overrides the VSH's UMD auto-start setting.
+	EmuScreen(const Path &filename, const Path &mountIso = Path(), std::optional<bool> umdAutoboot = std::nullopt);
 	~EmuScreen();
 
-	void update() override;
-	void render() override;
-	void preRender() override;
-	void postRender() override;
-	void dialogFinished(const Screen *dialog, DialogResult result) override;
-	void sendMessage(const char *msg, const char *value) override;
-	void resized() override;
+	const char *tag() const override { return "Emu"; }
 
-	bool touch(const TouchInput &touch) override;
+	void update() override;
+	ScreenRenderFlags render(ScreenRenderMode mode) override;
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
+	void sendMessage(UIMessage message, const char *value) override;
+	void resized() override;
+	ScreenRenderRole renderRole(bool isTop) const override;
+
+	InputMode PassInputToMapper() const override;
+
+	// We also need to do some special handling of queued UI events to handle closing the chat window.
 	bool key(const KeyInput &key) override;
-	bool axis(const AxisInput &axis) override;
+	bool touch(const TouchInput &key) override;
+
+	void deviceLost() override;
+	void deviceRestored(Draw::DrawContext *draw) override;
+
+protected:
+	void darken();
+	void drawGameOnOutputMessage();
+	void focusChanged(ScreenFocusChange focusChange) override;
+	ScreenRenderFlags PreRender(ScreenRenderMode mode) override;
+	bool renderOutput(const OutputDisplay &output) override;
+
+	// ControlListener implementations
+	void OnVKey(VirtKey virtualKeyCode, bool down) override;
+	void OnVKeyAnalog(VirtKey virtualKeyCode, float value) override;
+	void UpdatePSPButtons(uint32_t buttonMask, uint32_t changedMask) override;
+	void SetPSPAnalog(int rotation, int stick, float x, float y) override;
+	ViewLayoutMode LayoutMode() const override;
+
+	bool AllowFocusMovement() const override;
 
 private:
 	void CreateViews() override;
-	UI::EventReturn OnDevTools(UI::EventParams &params);
-	UI::EventReturn OnDisableCardboard(UI::EventParams &params);
-	UI::EventReturn OnChat(UI::EventParams &params);
-	UI::EventReturn OnResume(UI::EventParams &params);
-	UI::EventReturn OnReset(UI::EventParams &params);
+	ScreenRenderFlags RunEmulation(bool skipBufferEffects);
+	void UpdateGameOutput();
+	DeviceOrientation GameLayoutOrientation() const;
+	const DisplayLayoutConfig &GameLayoutConfig() const;
+	void OnDevTools(UI::EventParams &params);
+	void OpenChat(bool focus);
 
-	void bootGame(const Path &filename);
+	void HandleFlip();
+	void ProcessGameBoot(const Path &filename);
 	bool bootAllowStorage(const Path &filename);
 	void bootComplete();
 	bool hasVisibleUI();
 	void renderUI();
 
-	void onVKeyDown(int virtualKeyCode);
-	void onVKeyUp(int virtualKeyCode);
+	void AutoLoadSaveState();
+	bool checkPowerDown();
+	void leaveGame();
 
-	void autoLoad();
-	void checkPowerDown();
+	void ProcessQueuedVKeys();
+	void ProcessVKey(VirtKey vkey, bool down);
+
+	bool ShouldRunEmulation(ScreenRenderMode mode) const;
 
 	UI::Event OnDevMenu;
-	UI::Event OnChatMenu;
 	bool bootPending_ = true;
+	bool bootIsReset_ = false;
 	Path gamePath_;
+	Path mountIso_;
+	std::optional<bool> umdAutoboot_;
+	// The rest of a BootRequest from the emulated system (see PSP_RequestBoot).
+	std::optional<VSHLaunch> launchedFromVSH_;
+	std::vector<u8> vshmainArgs_;
 
-	// Something invalid was loaded, don't try to emulate
-	bool invalid_ = true;
 	bool quit_ = false;
-	bool stopRender_ = false;
 	std::string errorMessage_;
 
 	// If set, pauses at the end of the frame.
+	// We also poll the pause trigger from the ControlMapper. That needs refactoring.
 	bool pauseTrigger_ = false;
 
 	// The last read chat message count, and how many new ones there are.
@@ -102,14 +142,50 @@ private:
 	UI::CallbackColorTween *loadingViewColor_ = nullptr;
 	UI::VisibilityTween *loadingViewVisible_ = nullptr;
 	UI::Spinner *loadingSpinner_ = nullptr;
-	UI::TextView *loadingTextView_ = nullptr;
+	// Shown while a savestate is being saved or loaded, if that takes long enough to notice.
+	UI::Spinner *saveStateSpinner_ = nullptr;
+	double saveStateBusySince_ = -1.0;
 	UI::Button *resumeButton_ = nullptr;
 	UI::Button *resetButton_ = nullptr;
-	UI::View *chatButton_ = nullptr;
+	UI::Button *backButton_ = nullptr;
+	// On the crash screen while reporting is off.
+	UI::Button *reportCrashButton_ = nullptr;
+	// Under it, when cheats or plugins keep it disabled.
+	UI::TextView *reportCrashBlocked_ = nullptr;
+	// The current crash has been seen (and reported, if reporting is on).
+	bool crashSeen_ = false;
+	bool crashReported_ = false;
+	UI::Clickable *chatButton_ = nullptr;
 	ChatMenu *chatMenu_ = nullptr;
+	// Set when the chat opens. Stick movements don't reach the control mapper while it's open (key
+	// releases do), so what's held is let go up front.
+	bool releaseMapperInput_ = false;
 
 	UI::Button *cardboardDisableButton_ = nullptr;
-	OnScreenMessagesView *onScreenMessagesView_ = nullptr;
 
-	ControlMapper controlMapper_;
+	std::string extraAssertInfoStr_;
+
+	std::mutex queuedVirtKeysLock_;
+	std::vector<std::pair<VirtKey, bool>> queuedVirtKeys_;
+
+	bool frameStep_ = false;
+#ifndef MOBILE_DEVICE
+	bool startDumping_ = false;
+#endif
+	bool autoLoadFailed_ = false;  // to prevent repeat reloads
+	bool readyToFinishBoot_ = false;
+	bool skipBufferEffects_ = false;  // cached state, fetched once per frame.
+	// The game goes to a secondary output (OutputRole::Game) instead of the backbuffer. Per frame too.
+	bool gameOnOutput_ = false;
+	DeviceOrientation gameOutputOrientation_ = DeviceOrientation::Landscape;
+
+	uint32_t clearColor_ = 0;
+
+	// The HOME button's quit screen (as impose draws it on a PSP).
+	std::unique_ptr<ImposeHomeScreen> imposeHome_;
 };
+
+bool MustRunBehind();
+bool ShouldRunBehind();
+// The orientation of the output the game goes to (like a TV), if there's one. Its display layout is the one for that.
+bool GetGameOutputOrientation(ScreenManager *screenManager, DeviceOrientation *orientation);

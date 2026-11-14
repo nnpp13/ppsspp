@@ -19,12 +19,14 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
 
 #include "Common/CommonTypes.h"
 #include "Common/File/Path.h"
 #include "Common/LogReporting.h"
 
 class PointerWrap;
+struct MIPSExceptionInfo;
 
 namespace Reporting
 {
@@ -38,6 +40,12 @@ namespace Reporting
 	// Should be called whenever the game configuration changes.
 	void UpdateConfig();
 
+	// Should be called when debugging APIs are used in a way that could make the game crash.
+	void NotifyDebugger();
+
+	// Should be called for each LoadExec, with parameters of the module executed.
+	void NotifyExecModule(const char *name, int ver, uint32_t crc);
+
 	// Returns whether or not the reporting system is currently enabled.
 	bool IsEnabled();
 
@@ -46,7 +54,7 @@ namespace Reporting
 
 	// Set the current enabled state of the reporting system and desired reporting server host.
 	// Returns if anything was changed.
-	bool Enable(bool flag, std::string host);
+	bool Enable(bool flag, const std::string &host);
 
 	// Use the default reporting setting (per compiled settings) of host and enabled state.
 	void EnableDefault();
@@ -56,6 +64,22 @@ namespace Reporting
 
 	// Get the latest compatibility result.  Only valid when GetStatus() is not BUSY.
 	std::vector<std::string> CompatibilitySuggestions();
+
+	// Reporting is off, but a crash from this session would make a useful report.
+	bool CanReportCrashManually();
+
+	// Cheats or plugins are on. They can change the game's code, so its crashes aren't ours to report.
+	bool CheatsOrPluginsInEffect();
+
+	// No crash reports at all, automatic or requested, and no button to ask for one (in the VSH).
+	bool CrashReportsOff();
+
+	// Reports a game crash. Automatically when reporting is enabled, or when the user asks for it
+	// (to the default server, since reporting is off then).
+	void ReportCrash(const MIPSExceptionInfo &info, bool userRequested);
+
+	// The same crash in the same game was already reported this run, so ReportCrash() would skip it.
+	bool CrashAlreadyReported(const MIPSExceptionInfo &info);
 
 	// Queues game for CRC hash if needed.
 	void QueueCRC(const Path &gamePath);

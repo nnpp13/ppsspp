@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <mutex>
 #include <memory>
@@ -30,21 +32,28 @@ private:
 	struct MountPoint {
 		std::string prefix;
 		std::shared_ptr<IFileSystem> system;
+		// Optional subdirectory inside the filesystem to treat as the root for this mount.
+		// Example: mounting "ms0:" with subDir "/PSP/GAME" will map "ms0:/file"
+		// to the underlying filesystem path "/PSP/GAME/file".
+		std::string subDir;
 
 		bool operator == (const MountPoint &other) const {
-			return prefix == other.prefix && system == other.system;
+			return prefix == other.prefix && system == other.system && subDir == other.subDir;
 		}
 	};
 
 	// The order of this vector is meaningful - lookups are always a linear search from the start.
 	std::vector<MountPoint> fileSystems;
 
-	typedef std::map<int, std::string> currentDir_t;
-	currentDir_t currentDir;
+	std::map<int, std::string> currentDir;
 
 	std::string startingDirectory;
-	std::recursive_mutex lock;  // must be recursive
+	mutable std::recursive_mutex lock;  // must be recursive. TODO: fix that
 
+	// For the UMD host0 hack.
+	bool host0Mapped_ = false;
+
+	// Assumes the lock is held
 	void Reset() {
 		// This used to be 6, probably an attempt to replicate PSP handles.
 		// However, that's an artifact of using psplink anyway...
@@ -57,24 +66,35 @@ public:
 		Reset();
 	}
 
-	void Mount(std::string prefix, std::shared_ptr<IFileSystem> system);
-	// Fails if there's not already a file system at prefix.
-	bool Remount(std::string prefix, std::shared_ptr<IFileSystem> system);
+	// Opens of files that aren't on the disc, and reads and seeks on handles whose file was dropped
+	// when a savestate loaded. With the real disc these are rare, so they tell when a game booted
+	// from a state alone has missed data it needed.
+	int FailedDiscReads() const { return failedDiscReads_; }
+	void ResetFailedDiscReads() { failedDiscReads_ = 0; }
 
+	// Will replace the existing mount if already exists. Mount with an optional sub-directory inside the filesystem to treat as the root.
+	void Mount(std::string_view prefix, std::shared_ptr<IFileSystem> system, std::string_view subDir = std::string_view());
 	void UnmountAll();
-	void Unmount(std::string prefix);
+	void Unmount(std::string_view prefix);
+
+	// Would like to make this const, but...
+	std::vector<MountPoint> &GetMounts() {
+		return fileSystems;
+	}
 
 	// The pointer returned from these are for temporary usage only. Do not store.
-	IFileSystem *GetSystem(const std::string &prefix);
-	IFileSystem *GetSystemFromFilename(const std::string &filename);
-	IFileSystem *GetHandleOwner(u32 handle);
-	FileSystemFlags FlagsFromFilename(const std::string &filename) {
+	IFileSystem *GetSystem(std::string_view prefix);
+	IFileSystem *GetSystemFromFilename(std::string_view filename);
+	IFileSystem *GetHandleOwner(u32 handle) const;
+	FileSystemFlags FlagsFromFilename(std::string_view filename) {
 		IFileSystem *sys = GetSystemFromFilename(filename);
 		return sys ? sys->Flags() : FileSystemFlags::NONE;
 	}
 
 	void ThreadEnded(int threadID);
 	void Shutdown();
+
+	std::string GetCurrentDirForThread(int threadID) const;
 
 	u32 GetNewHandle() override {
 		u32 res = current++;
@@ -88,11 +108,11 @@ public:
 
 	void DoState(PointerWrap &p) override;
 
-	int MapFilePath(const std::string &inpath, std::string &outpath, MountPoint **system);
+	int MapFilePath(std::string_view inpath, std::string *outpath, MountPoint **system);
 
-	inline int MapFilePath(const std::string &_inpath, std::string &outpath, IFileSystem **system) {
-		MountPoint *mountPoint;
-		int error = MapFilePath(_inpath, outpath, &mountPoint);
+	inline int MapFilePath(std::string_view inpath, std::string *outpath, IFileSystem **system) {
+		MountPoint *mountPoint = nullptr;
+		int error = MapFilePath(inpath, outpath, &mountPoint);
 		if (error == 0) {
 			*system = mountPoint->system.get();
 			return error;
@@ -101,9 +121,9 @@ public:
 		return error;
 	}
 
-	std::string NormalizePrefix(std::string prefix) const;
+	std::string_view NormalizePrefix(std::string_view prefix) const;
 
-	std::vector<PSPFileInfo> GetDirListing(std::string path) override;
+	std::vector<PSPFileInfo> GetDirListing(std::string_view path, bool *exists = nullptr) override;
 	int      OpenFile(std::string filename, FileAccess access, const char *devicename = nullptr) override;
 	void     CloseFile(u32 handle) override;
 	size_t   ReadFile(u32 handle, u8 *pointer, s64 size) override;
@@ -112,6 +132,7 @@ public:
 	size_t   WriteFile(u32 handle, const u8 *pointer, s64 size, int &usec) override;
 	size_t   SeekFile(u32 handle, s32 position, FileMove type) override;
 	PSPFileInfo GetFileInfo(std::string filename) override;
+	PSPFileInfo GetFileInfoByHandle(u32 handle) override;
 	bool     OwnsHandle(u32 handle) override { return false; }
 	inline size_t GetSeekPos(u32 handle) {
 		return SeekFile(handle, 0, FILEMOVE_CURRENT);
@@ -123,32 +144,30 @@ public:
 	bool RmDir(const std::string &dirname) override;
 	int  RenameFile(const std::string &from, const std::string &to) override;
 	bool RemoveFile(const std::string &filename) override;
+	bool SetFileWritable(const std::string &filename, bool writable) override;
 	int  Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 outlen, int &usec) override;
 	PSPDevType DevType(u32 handle) override;
-	FileSystemFlags Flags() override { return FileSystemFlags::NONE; }
-	u64  FreeSpace(const std::string &path) override;
+	FileSystemFlags Flags() const override { return FileSystemFlags::NONE; }
+	u64  FreeDiskSpace(const std::string &path) override;
 
 	// Convenience helper - returns < 0 on failure.
-	int ReadEntireFile(const std::string &filename, std::vector<u8> &data);
+	// Fails (without allocating) if the file is larger than maxSize.
+	int ReadEntireFile(const std::string &filename, std::vector<u8> &data, bool quiet = false, size_t maxSize = (size_t)-1);
 
-	void SetStartingDirectory(const std::string &dir) {
+	void SetStartingDirectory(std::string_view dir) {
 		std::lock_guard<std::recursive_mutex> guard(lock);
 		startingDirectory = dir;
 	}
 
-	int64_t ComputeRecursiveDirectorySize(const std::string &dirPath);
+	int64_t ComputeRecursiveDirectorySize(std::string_view dirPath);
 
-	// Shouldn't ever be called, but meh.
-	bool ComputeRecursiveDirSizeIfFast(const std::string &path, int64_t *size) override {
-		int64_t sizeTemp = ComputeRecursiveDirectorySize(path);
-		if (sizeTemp >= 0) {
-			*size = sizeTemp;
-			return true;
-		} else {
-			return false;
-		}
-	}
+	bool ComputeRecursiveDirSizeIfFast(const std::string &path, int64_t *size) override;
+
+	void Describe(char *buf, size_t size) const override { snprintf(buf, size, "Meta"); }
 
 private:
-	int64_t RecursiveSize(const std::string &dirPath);
+	std::atomic<int> failedDiscReads_{};
+
+	void DoStatePositionalMounts(PointerWrap &p);
+	int64_t RecursiveSize(std::string_view dirPath);
 };

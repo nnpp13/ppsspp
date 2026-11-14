@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstring>
 #include <sstream>
 #include <cstdint>
 
@@ -53,7 +54,7 @@ private:
 	bool ParseVersionString(std::string str);
 };
 
-bool ParseMacAddress(std::string str, uint8_t macAddr[6]);
+bool ParseMacAddress(const std::string &str, uint8_t macAddr[6]);
 
 bool TryParse(const std::string &str, bool *const output);
 bool TryParse(const std::string &str, uint32_t *const output);
@@ -71,4 +72,10 @@ static bool TryParse(const std::string &str, N *const output) {
 		return false;
 }
 
-void NiceSizeFormat(size_t size, char *out, size_t bufSize);
+void NiceSizeFormat(uint64_t size, char *out, size_t bufSize);
+
+std::string NiceSizeFormat(uint64_t size);
+
+// seconds, or minutes, or hours.
+// Uses I18N strings.
+std::string NiceTimeFormat(int seconds);
